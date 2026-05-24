@@ -11,7 +11,8 @@
     "tauri": "tauri",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
+    "routes": "tsr generate",
+    "typecheck": "tsr generate && tsc --noEmit",
     "lint": "biome lint .",
     "format": "biome format --write .",
     "format:check": "biome format .",
@@ -36,6 +37,7 @@
   "devDependencies": {
     "@biomejs/biome": "^2.4.15",
     "@tailwindcss/vite": "^4.0.0",
+    "@tanstack/router-cli": "^1.167.9",
     "@tanstack/router-plugin": "^1.95.0",
     "@tauri-apps/cli": "^2",
     "@testing-library/jest-dom": "^6.9.1",
