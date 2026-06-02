@@ -1,6 +1,7 @@
 mod caches;
 mod claude_path;
 mod commands;
+mod instance_settings;
 mod poller;
 mod proc;
 mod settings;
@@ -30,6 +31,11 @@ pub fn run() {
             let shared_settings: settings::SharedSettings = Arc::new(settings);
             app.manage(shared_settings);
 
+            let instance_settings = instance_settings::InstanceSettingsStore::load(&app_data_dir)?;
+            let shared_instance_settings: instance_settings::SharedInstanceSettings =
+                Arc::new(instance_settings);
+            app.manage(shared_instance_settings);
+
             watchers::spawn(app.handle().clone(), shared.clone());
             poller::spawn(app.handle().clone());
 
@@ -43,6 +49,11 @@ pub fn run() {
             commands::projects::set_pinned,
             commands::git::git_status,
             commands::git::git_diff,
+            commands::git::git_default_branch,
+            commands::git::git_branches,
+            commands::git::git_base_diff,
+            commands::instance_settings::get_instance_base_branch,
+            commands::instance_settings::set_instance_base_branch,
             commands::github::pr_status,
             commands::agents::agent_status,
             commands::discover::discover_claude_projects,

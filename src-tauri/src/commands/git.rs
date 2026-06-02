@@ -100,6 +100,110 @@ pub fn git_diff(path: String, scope: String) -> Result<String, String> {
     }
 }
 
+/// Best-effort detection of the repository's default/base branch.
+///   1. The remote's `origin/HEAD` symbolic ref (e.g. `origin/main` -> `main`).
+///   2. Fallback: the first of `main`/`master`/`develop` that exists locally.
+///
+/// Returns `None` when nothing matches (e.g. a fresh repo with an exotic branch).
+pub fn detect_default_branch(cwd: &Path) -> Option<String> {
+    if let Ok(s) = run_git(
+        cwd,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    ) {
+        if let Some(name) = s.trim().strip_prefix("origin/") {
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    for cand in ["main", "master", "develop"] {
+        if run_git(
+            cwd,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{cand}"),
+            ],
+        )
+        .is_ok()
+        {
+            return Some(cand.to_string());
+        }
+    }
+    None
+}
+
+/// Pure parser for `git for-each-ref --format=%(refname:short)` output: dedupes
+/// and drops `*/HEAD` pseudo-refs so the result is a clean branch-picker list.
+pub fn parse_branch_refs(raw: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let name = line.trim();
+        if name.is_empty() || name.ends_with("/HEAD") {
+            continue;
+        }
+        if seen.insert(name.to_string()) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+pub fn list_branches(cwd: &Path) -> Result<Vec<String>, String> {
+    let raw = run_git(
+        cwd,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )?;
+    Ok(parse_branch_refs(&raw))
+}
+
+#[tauri::command]
+pub fn git_default_branch(path: String) -> Option<String> {
+    detect_default_branch(Path::new(&path))
+}
+
+#[tauri::command]
+pub fn git_branches(path: String) -> Result<Vec<String>, String> {
+    list_branches(Path::new(&path))
+}
+
+/// The full diff of the working tree (or HEAD) against the merge base with
+/// `base` — the complete delta this session introduced. Diffing against the
+/// merge base, not the base tip, excludes changes made on `base` after the
+/// branches diverged, matching how a pull request renders.
+///
+///   * `include_working_tree` -> `git diff <merge-base>`      (committed + uncommitted)
+///   * otherwise               -> `git diff <merge-base>..HEAD` (committed only, PR-style)
+#[tauri::command]
+pub fn git_base_diff(
+    path: String,
+    base: String,
+    include_working_tree: bool,
+) -> Result<String, String> {
+    let cwd = Path::new(&path);
+    let base = base.trim();
+    if base.is_empty() {
+        return Err("no base branch specified".to_string());
+    }
+    let merge_base = run_git(cwd, &["merge-base", base, "HEAD"])?;
+    let merge_base = merge_base.trim();
+    if merge_base.is_empty() {
+        return Err(format!("no common ancestor between HEAD and {base}"));
+    }
+    if include_working_tree {
+        run_git(cwd, &["diff", "--no-color", merge_base])
+    } else {
+        run_git(cwd, &["diff", "--no-color", &format!("{merge_base}..HEAD")])
+    }
+}
+
 const UNTRACKED_FILE_BYTES_CAP: usize = 256 * 1024;
 const UNTRACKED_TOTAL_BYTES_CAP: usize = 4 * 1024 * 1024;
 const UNTRACKED_FILE_COUNT_CAP: usize = 500;
@@ -257,5 +361,12 @@ mod tests {
     fn accepts_text() {
         let bytes = b"plain text\n with newlines\n";
         assert!(!is_likely_binary(bytes));
+    }
+
+    #[test]
+    fn branch_refs_dedupe_and_drop_head() {
+        let raw = "main\norigin/main\norigin/HEAD\nfeature/x\nmain\n\n";
+        let got = parse_branch_refs(raw);
+        assert_eq!(got, vec!["main", "origin/main", "feature/x"]);
     }
 }

@@ -17,15 +17,23 @@ export function DiffView({ raw, defaultOpen = false }: { raw: string; defaultOpe
     return <div className="px-3 py-3 text-[11px] text-[var(--color-fg-subtle)]">No changes.</div>;
   }
   return (
-    <div className="flex flex-col gap-2 px-2 py-2">
+    <div className="max-h-[520px] overflow-auto">
       {files.map((file, i) => (
-        <FileCard key={i} file={file} defaultOpen={defaultOpen} />
+        <FileCard key={i} file={file} defaultOpen={defaultOpen} isFirst={i === 0} />
       ))}
     </div>
   );
 }
 
-function FileCard({ file, defaultOpen }: { file: FileDiff; defaultOpen: boolean }) {
+function FileCard({
+  file,
+  defaultOpen,
+  isFirst,
+}: {
+  file: FileDiff;
+  defaultOpen: boolean;
+  isFirst: boolean;
+}) {
   const [open, setOpen] = useState(defaultOpen);
   const displayPath = file.newPath ?? file.oldPath ?? "(unknown)";
 
@@ -37,10 +45,13 @@ function FileCard({ file, defaultOpen }: { file: FileDiff; defaultOpen: boolean 
       : "text-[var(--color-fg-muted)]";
 
   return (
-    <div className="overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-bg)]/30">
+    <div className={cn(!isFirst && "border-t border-[var(--color-border)]")}>
       <button
         onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left hover:bg-[var(--color-surface)]/60"
+        className={cn(
+          "sticky top-0 z-10 flex w-full items-center gap-2 bg-[var(--color-bg-elevated)] px-2.5 py-1.5 text-left hover:bg-[var(--color-surface)]",
+          open && "border-b border-[var(--color-border)]"
+        )}
       >
         {open ? (
           <ChevronDownIcon size={12} className="text-[var(--color-fg-subtle)]" />
@@ -61,7 +72,7 @@ function FileCard({ file, defaultOpen }: { file: FileDiff; defaultOpen: boolean 
         )}
       </button>
       {open && !file.isBinary && (
-        <div className="overflow-x-auto border-t border-[var(--color-border)] bg-[var(--color-bg)]/60 px-2 py-1.5 font-mono text-[11.5px] leading-[1.55]">
+        <div className="overflow-x-auto bg-[var(--color-bg)]/60 px-2.5 py-1.5 font-mono text-[11.5px] leading-[1.55]">
           {file.hunks.map((h, hi) => (
             <div key={hi} className={hi > 0 ? "mt-2" : undefined}>
               <div className="px-1 text-[11px] text-[var(--color-info)]">{h.header}</div>
