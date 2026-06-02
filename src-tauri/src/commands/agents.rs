@@ -323,6 +323,73 @@ fn find_claude_process(project_path: &Path, snap: &ProcessSnapshot) -> Option<u3
     None
 }
 
+/// Resolve the pid of the claude process backing a session displayed under
+/// `instance_path`, searching the whole project subtree.
+///
+/// "Open terminal" needs the process even when the session was launched in an
+/// ancestor directory (e.g. the repo root) but is now shown under a nested
+/// worktree instance: there `find_claude_process(instance)` returns `None`
+/// because the process cwd (the root) isn't under the worktree. We then look for
+/// the claude process whose cwd is the closest ancestor of the instance within
+/// the project, falling back to the sole claude process in the project if
+/// there's exactly one.
+pub fn find_session_process(
+    instance_path: &Path,
+    project_root: &Path,
+    snap: &ProcessSnapshot,
+) -> Option<u32> {
+    resolve_session_pid(&snap.procs, instance_path, project_root)
+}
+
+/// Pure core of [`find_session_process`], testable without a `ProcessSnapshot`.
+/// Priority: (1) a claude process rooted at/under the instance, (2) the claude
+/// process whose cwd is the closest ancestor of the instance within the project,
+/// (3) the sole claude process in the project if there's exactly one.
+fn resolve_session_pid(
+    procs: &[(u32, String, String, PathBuf)],
+    instance_path: &Path,
+    project_root: &Path,
+) -> Option<u32> {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let instance_canon = canon(instance_path);
+    let root_canon = canon(project_root);
+
+    let mut best_ancestor: Option<(usize, u32)> = None;
+    let mut in_project: Vec<u32> = Vec::new();
+
+    for (pid, name, exe, cwd) in procs.iter() {
+        if !looks_like_claude_cli(name, exe) || cwd.as_os_str().is_empty() {
+            continue;
+        }
+        let cwd_canon = canon(cwd);
+        // Fast path: a claude process rooted at (or under) the instance itself.
+        if cwd_canon == instance_canon || cwd_canon.starts_with(&instance_canon) {
+            return Some(*pid);
+        }
+        if !cwd_canon.starts_with(&root_canon) {
+            continue;
+        }
+        in_project.push(*pid);
+        // Prefer a process whose cwd is an ancestor of the instance (the session
+        // was launched above the worktree); pick the closest such ancestor.
+        if instance_canon.starts_with(&cwd_canon) {
+            let depth = cwd_canon.components().count();
+            if best_ancestor.map_or(true, |(d, _)| depth > d) {
+                best_ancestor = Some((depth, *pid));
+            }
+        }
+    }
+
+    if let Some((_, pid)) = best_ancestor {
+        return Some(pid);
+    }
+    // Last resort: exactly one claude session in the whole project — unambiguous.
+    if in_project.len() == 1 {
+        return Some(in_project[0]);
+    }
+    None
+}
+
 #[tauri::command]
 pub fn agent_status(
     caches: tauri::State<crate::caches::SharedCaches>,
@@ -527,6 +594,80 @@ pub fn matches_instance(t: &TranscriptSummary, instance_path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn claude(pid: u32, cwd: &str) -> (u32, String, String, PathBuf) {
+        (
+            pid,
+            "claude".to_string(),
+            "/Users/x/.local/bin/claude".to_string(),
+            PathBuf::from(cwd),
+        )
+    }
+
+    #[test]
+    fn session_pid_fast_path_at_instance() {
+        let procs = vec![claude(100, "/repo")];
+        // Instance is the repo root; claude runs there.
+        assert_eq!(
+            resolve_session_pid(&procs, Path::new("/repo"), Path::new("/repo")),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn session_pid_falls_back_to_ancestor_for_nested_worktree() {
+        // The fusily scenario: claude runs at the repo root, but the session is
+        // displayed under a nested worktree instance with no process of its own.
+        let root = "/repo";
+        let worktree = "/repo/.claude/worktrees/feat/backend";
+        let procs = vec![
+            claude(100, root),     // the real session, at the root
+            claude(200, "/other"), // unrelated claude outside the project
+        ];
+        assert_eq!(
+            resolve_session_pid(&procs, Path::new(worktree), Path::new(root)),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn session_pid_prefers_closest_ancestor() {
+        let root = "/repo";
+        let worktree = "/repo/a/b/wt";
+        let procs = vec![
+            claude(100, "/repo"),     // ancestor (far)
+            claude(101, "/repo/a/b"), // ancestor (closer) — should win
+        ];
+        assert_eq!(
+            resolve_session_pid(&procs, Path::new(worktree), Path::new(root)),
+            Some(101)
+        );
+    }
+
+    #[test]
+    fn session_pid_is_none_when_ambiguous_and_no_ancestor() {
+        // Two sibling worktree sessions, neither an ancestor of the target, and
+        // more than one candidate in the project -> refuse to guess.
+        let root = "/repo";
+        let target = "/repo/wt-a";
+        let procs = vec![claude(100, "/repo/wt-b"), claude(101, "/repo/wt-c")];
+        assert_eq!(
+            resolve_session_pid(&procs, Path::new(target), Path::new(root)),
+            None
+        );
+    }
+
+    #[test]
+    fn session_pid_sole_project_claude_is_used() {
+        // Exactly one claude in the project, not an ancestor -> unambiguous, use it.
+        let root = "/repo";
+        let target = "/repo/wt-a";
+        let procs = vec![claude(100, "/repo/wt-b"), claude(200, "/elsewhere")];
+        assert_eq!(
+            resolve_session_pid(&procs, Path::new(target), Path::new(root)),
+            Some(100)
+        );
+    }
 
     fn assistant_text_line(text: &str) -> String {
         format!(

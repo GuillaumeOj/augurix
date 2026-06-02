@@ -97,6 +97,35 @@ export interface DiscoveredProject {
   already_added: boolean;
 }
 
+export type TerminalChoice = "apple-terminal" | "iterm2" | "kitty";
+
+export interface Settings {
+  terminal: TerminalChoice | null;
+}
+
+export interface TerminalInfo {
+  choice: TerminalChoice;
+  name: string;
+  installed: boolean;
+  ready: boolean;
+  note: string | null;
+}
+
+export type OpenTerminalOutcome =
+  | { status: "ok" }
+  | { status: "needs-setup" }
+  | { status: "kitty-needs-setup" }
+  | { status: "error"; message: string };
+
+export interface KittySetupResult {
+  changed: boolean;
+  config_path: string;
+  backup_path: string | null;
+  needs_restart: boolean;
+  ready: boolean;
+  message: string;
+}
+
 export const api = {
   listProjects: () => invoke<Project[]>("list_projects"),
   addProject: (path: string) => invoke<Project>("add_project", { path }),
@@ -123,4 +152,11 @@ export const api = {
       instanceId,
       limit: limit ?? null,
     }),
+
+  getSettings: () => invoke<Settings>("get_settings"),
+  setTerminal: (choice: TerminalChoice) => invoke<Settings>("set_terminal", { choice }),
+  detectTerminals: () => invoke<TerminalInfo[]>("detect_terminals"),
+  setupKitty: () => invoke<KittySetupResult>("setup_kitty"),
+  openTerminal: (pid: number | null, cwd: string, projectRoot: string | null) =>
+    invoke<OpenTerminalOutcome>("open_terminal", { pid, cwd, projectRoot }),
 };

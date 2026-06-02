@@ -3,6 +3,7 @@ mod claude_path;
 mod commands;
 mod poller;
 mod proc;
+mod settings;
 mod store;
 mod types;
 mod watchers;
@@ -25,6 +26,10 @@ pub fn run() {
             let caches: caches::SharedCaches = Arc::new(caches::Caches::new());
             app.manage(caches);
 
+            let settings = settings::SettingsStore::load(&app_data_dir)?;
+            let shared_settings: settings::SharedSettings = Arc::new(settings);
+            app.manage(shared_settings);
+
             watchers::spawn(app.handle().clone(), shared.clone());
             poller::spawn(app.handle().clone());
 
@@ -45,6 +50,11 @@ pub fn run() {
             commands::status::project_with_instances,
             commands::status::instance_status,
             commands::status::instance_messages,
+            commands::terminal::get_settings,
+            commands::terminal::set_terminal,
+            commands::terminal::detect_terminals,
+            commands::terminal::setup_kitty,
+            commands::terminal::open_terminal,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -5,3 +5,4 @@ pub mod github;
 pub mod instances;
 pub mod projects;
 pub mod status;
+pub mod terminal;
