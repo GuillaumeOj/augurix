@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Claude Code worktrees
+.claude/worktrees
+
 # Rust / Tauri
 src-tauri/target/
 src-tauri/gen/schemas/

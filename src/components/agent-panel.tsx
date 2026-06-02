@@ -12,6 +12,7 @@ import { useEffect, useRef, useState } from "react";
 import { useInstanceMessages } from "@/lib/queries";
 import { type AgentStatus, api, type TranscriptMessage, type UUID } from "@/lib/tauri";
 import { cn, relativeTime } from "@/lib/utils";
+import { Markdown } from "./markdown";
 import { STATE_LABELS, StatusDot } from "./status-dot";
 
 export function AgentPanel({
@@ -199,11 +200,7 @@ function MessageRow({ message }: { message: TranscriptMessage }) {
             {relativeTime(message.timestamp)}
           </span>
         </div>
-        {message.text && (
-          <div className="mt-1 text-[12.5px] leading-snug text-[var(--color-fg)] whitespace-pre-wrap break-words">
-            {message.text}
-          </div>
-        )}
+        {message.text && <Markdown text={message.text} />}
         {message.tool_uses.length > 0 && (
           <div className="mt-1.5 flex flex-wrap gap-1">
             {message.tool_uses.map((t, i) => (
