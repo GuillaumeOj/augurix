@@ -199,7 +199,11 @@ function ProjectDetail() {
               projectRoot={pwi.project.path}
             />
             <PrCard pr={activeInstance.status.pr ?? null} />
-            <GitPanel git={activeInstance.status.git} projectPath={activeInstance.path} />
+            <GitPanel
+              git={activeInstance.status.git}
+              projectPath={activeInstance.path}
+              instanceId={activeInstance.id}
+            />
           </div>
         )}
       </div>

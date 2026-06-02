@@ -4,14 +4,31 @@ import {
   ChevronDownIcon,
   ChevronRightIcon,
   GitBranchIcon,
+  GitCompareIcon,
 } from "lucide-react";
 import { useState } from "react";
-import { type DiffScope, useGitDiff } from "@/lib/queries";
-import type { GitStatus } from "@/lib/tauri";
+import {
+  type DiffScope,
+  useBaseDiff,
+  useBranches,
+  useDefaultBranch,
+  useGitDiff,
+  useInstanceBaseOverride,
+  useSetInstanceBaseOverride,
+} from "@/lib/queries";
+import type { GitStatus, UUID } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import { DiffView } from "./diff-view";
 
-export function GitPanel({ git, projectPath }: { git: GitStatus; projectPath: string }) {
+export function GitPanel({
+  git,
+  projectPath,
+  instanceId,
+}: {
+  git: GitStatus;
+  projectPath: string;
+  instanceId: UUID;
+}) {
   const [openSections, setOpenSections] = useState<Record<DiffScope, boolean>>({
     unstaged: true,
     staged: false,
@@ -85,6 +102,8 @@ export function GitPanel({ git, projectPath }: { git: GitStatus; projectPath: st
         ))}
       </div>
 
+      <BaseDiffSection projectPath={projectPath} instanceId={instanceId} />
+
       <DiffSection
         title="Unstaged"
         scope="unstaged"
@@ -145,18 +164,150 @@ function DiffSection({
         {empty && <span className="text-[var(--color-fg-subtle)]">— empty</span>}
       </button>
       {open && !empty && (
-        <div className="max-h-[520px] overflow-auto border-t border-[var(--color-border)] bg-[var(--color-bg)]/40">
-          {diff.isLoading && (
-            <div className="px-3 py-3 text-[11px] text-[var(--color-fg-subtle)]">Loading…</div>
-          )}
-          {diff.error && (
-            <div className="px-3 py-3 text-[11px] text-[var(--color-danger)]">
-              {String(diff.error)}
-            </div>
-          )}
-          {diff.data && <DiffView raw={diff.data} defaultOpen={scope === "unstaged"} />}
+        <div className="border-t border-[var(--color-border)] bg-[var(--color-bg)]/40">
+          <DiffPaneBody
+            isLoading={diff.isLoading}
+            error={diff.error}
+            data={diff.data}
+            defaultOpen={scope === "unstaged"}
+          />
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * The body of an open diff section: the loading / error / diff states. `DiffView`
+ * owns its own `max-h`/scroll, so the sticky file headers it renders pin against
+ * a scroll container it controls — no implicit dependency on the parent's layout.
+ */
+function DiffPaneBody({
+  isLoading,
+  error,
+  data,
+  defaultOpen,
+}: {
+  isLoading: boolean;
+  error: unknown;
+  data: string | undefined;
+  defaultOpen: boolean;
+}) {
+  if (isLoading) {
+    return <div className="px-3 py-3 text-[11px] text-[var(--color-fg-subtle)]">Loading…</div>;
+  }
+  if (error) {
+    return <div className="px-3 py-3 text-[11px] text-[var(--color-danger)]">{String(error)}</div>;
+  }
+  if (data !== undefined) {
+    return <DiffView raw={data} defaultOpen={defaultOpen} />;
+  }
+  return null;
+}
+
+/**
+ * The whole diff of this worktree against its base branch — the delta a reviewer
+ * cares about before merging. The base is auto-detected (origin/HEAD → main/…)
+ * with a persisted per-instance override, and a sub-toggle switches between all
+ * changes (working tree included) and committed-only (PR-style).
+ */
+function BaseDiffSection({ projectPath, instanceId }: { projectPath: string; instanceId: UUID }) {
+  const [open, setOpen] = useState(false);
+  const [includeWorkingTree, setIncludeWorkingTree] = useState(true);
+
+  const detected = useDefaultBranch(projectPath, true);
+  const override = useInstanceBaseOverride(instanceId);
+  const branches = useBranches(projectPath, open);
+  const setOverride = useSetInstanceBaseOverride(instanceId, projectPath);
+
+  const effectiveBase = override.data ?? detected.data ?? undefined;
+  const diff = useBaseDiff(projectPath, effectiveBase, includeWorkingTree, open && !!effectiveBase);
+  const hasBase = !!effectiveBase;
+
+  return (
+    <div className="border-t border-[var(--color-border)]">
+      <div className="flex items-center gap-2 px-4 py-2 text-[12px] font-medium text-[var(--color-fg-muted)]">
+        <button
+          onClick={() => setOpen((v) => !v)}
+          className="flex items-center gap-2 text-left hover:text-[var(--color-fg)]"
+        >
+          {open ? <ChevronDownIcon size={13} /> : <ChevronRightIcon size={13} />}
+          <GitCompareIcon size={13} />
+          <span>vs {effectiveBase ?? "base"}</span>
+        </button>
+
+        {open && (
+          <div className="ml-auto flex items-center gap-2">
+            <select
+              value={override.data ?? ""}
+              onChange={(e) => setOverride.mutate(e.target.value || null)}
+              className="rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-1.5 py-0.5 text-[11px] text-[var(--color-fg)]"
+              title="Base branch to compare against"
+            >
+              <option value="">Auto{detected.data ? ` (${detected.data})` : ""}</option>
+              {branches.data?.map((b) => (
+                <option key={b} value={b}>
+                  {b}
+                </option>
+              ))}
+            </select>
+            <div className="flex overflow-hidden rounded border border-[var(--color-border)] text-[11px]">
+              <SegButton
+                active={includeWorkingTree}
+                onClick={() => setIncludeWorkingTree(true)}
+                label="All changes"
+              />
+              <SegButton
+                active={!includeWorkingTree}
+                onClick={() => setIncludeWorkingTree(false)}
+                label="Committed"
+              />
+            </div>
+          </div>
+        )}
+      </div>
+      {open && (
+        <div className="border-t border-[var(--color-border)] bg-[var(--color-bg)]/40">
+          {hasBase ? (
+            <DiffPaneBody
+              isLoading={diff.isLoading}
+              error={diff.error}
+              data={diff.data}
+              defaultOpen={false}
+            />
+          ) : (
+            !detected.isLoading && (
+              <div className="px-3 py-3 text-[11px] text-[var(--color-fg-subtle)]">
+                No base branch detected — pick one above.
+              </div>
+            )
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SegButton({
+  active,
+  onClick,
+  label,
+}: {
+  active: boolean;
+  onClick: () => void;
+  label: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={cn(
+        "px-2 py-0.5 transition-colors",
+        active
+          ? "bg-[var(--color-surface)] text-[var(--color-fg)]"
+          : "text-[var(--color-fg-subtle)] hover:text-[var(--color-fg)]"
+      )}
+    >
+      {label}
+    </button>
   );
 }

@@ -135,6 +135,14 @@ export const api = {
 
   gitDiff: (path: string, scope: "unstaged" | "staged" | "untracked") =>
     invoke<string>("git_diff", { path, scope }),
+  gitDefaultBranch: (path: string) => invoke<string | null>("git_default_branch", { path }),
+  gitBranches: (path: string) => invoke<string[]>("git_branches", { path }),
+  gitBaseDiff: (path: string, base: string, includeWorkingTree: boolean) =>
+    invoke<string>("git_base_diff", { path, base, includeWorkingTree }),
+  getInstanceBaseBranch: (instanceId: UUID) =>
+    invoke<string | null>("get_instance_base_branch", { instanceId }),
+  setInstanceBaseBranch: (instanceId: UUID, baseBranch: string | null) =>
+    invoke<void>("set_instance_base_branch", { instanceId, baseBranch }),
 
   discover: () => invoke<DiscoveredProject[]>("discover_claude_projects"),
 
