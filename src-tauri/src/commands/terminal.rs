@@ -399,6 +399,7 @@ fn configured_kitty_socket_base() -> Option<PathBuf> {
 ///   1. the `listen_on` path from kitty.conf (authoritative — e.g. `mykitty`),
 ///   2. our auto-setup default `/tmp/kitty`,
 ///   3. a safety net: any `/tmp` entry whose name contains "kitty".
+///
 /// Reachability is proven later by actually running `kitty @ ... ls`, so any
 /// non-socket false positives collected here are harmless.
 fn kitty_sockets() -> Vec<PathBuf> {

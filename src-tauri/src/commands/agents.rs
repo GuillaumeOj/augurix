@@ -374,7 +374,7 @@ fn resolve_session_pid(
         // was launched above the worktree); pick the closest such ancestor.
         if instance_canon.starts_with(&cwd_canon) {
             let depth = cwd_canon.components().count();
-            if best_ancestor.map_or(true, |(d, _)| depth > d) {
+            if best_ancestor.is_none_or(|(d, _)| depth > d) {
                 best_ancestor = Some((depth, *pid));
             }
         }
