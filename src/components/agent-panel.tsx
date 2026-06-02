@@ -1,4 +1,6 @@
+import { useNavigate } from "@tanstack/react-router";
 import {
+  Loader2Icon,
   SparklesIcon,
   SquareIcon,
   TerminalIcon,
@@ -6,9 +8,9 @@ import {
   WrenchIcon,
   ZapIcon,
 } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useInstanceMessages } from "@/lib/queries";
-import type { AgentStatus, TranscriptMessage, UUID } from "@/lib/tauri";
+import { type AgentStatus, api, type TranscriptMessage, type UUID } from "@/lib/tauri";
 import { cn, relativeTime } from "@/lib/utils";
 import { STATE_LABELS, StatusDot } from "./status-dot";
 
@@ -16,12 +18,42 @@ export function AgentPanel({
   agent,
   projectId,
   instanceId,
+  cwd,
+  projectRoot,
 }: {
   agent: AgentStatus;
   projectId: UUID;
   instanceId: UUID;
+  cwd: string;
+  projectRoot: string;
 }) {
   const messages = useInstanceMessages(projectId, instanceId, 50);
+  const navigate = useNavigate();
+  const [opening, setOpening] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const openTerminal = async () => {
+    if (opening) return;
+    setOpening(true);
+    setError(null);
+    try {
+      const outcome = await api.openTerminal(agent.pid, cwd, projectRoot);
+      switch (outcome.status) {
+        case "needs-setup":
+        case "kitty-needs-setup":
+          navigate({ to: "/settings" });
+          break;
+        case "error":
+          setError(outcome.message);
+          break;
+        // "ok": focus already jumped — nothing to do.
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setOpening(false);
+    }
+  };
 
   return (
     <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-elevated)]">
@@ -42,14 +74,27 @@ export function AgentPanel({
         </div>
         <div className="flex items-center gap-1">
           <ActionButton
-            icon={<TerminalIcon size={13} />}
+            icon={
+              opening ? (
+                <Loader2Icon size={13} className="animate-spin" />
+              ) : (
+                <TerminalIcon size={13} />
+              )
+            }
             label="Open terminal"
-            disabled
-            tooltip="Coming soon"
+            onClick={openTerminal}
+            disabled={opening}
+            tooltip="Jump to the terminal window running this session"
           />
           <ActionButton icon={<ZapIcon size={13} />} label="Send" disabled tooltip="Coming soon" />
         </div>
       </div>
+
+      {error && (
+        <div className="border-b border-[var(--color-border)] bg-[var(--color-danger)]/10 px-4 py-2 text-[11.5px] text-[var(--color-danger)]">
+          {error}
+        </div>
+      )}
 
       <TranscriptList
         messages={messages.data ?? []}
@@ -189,15 +234,18 @@ function ActionButton({
   label,
   disabled,
   tooltip,
+  onClick,
 }: {
   icon: React.ReactNode;
   label: string;
   disabled?: boolean;
   tooltip?: string;
+  onClick?: () => void;
 }) {
   return (
     <button
       title={tooltip}
+      onClick={onClick}
       disabled={disabled}
       className={cn(
         "inline-flex items-center gap-1.5 rounded-md border border-[var(--color-border)] px-2 py-1 text-[11px] font-medium",

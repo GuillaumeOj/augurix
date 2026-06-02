@@ -195,6 +195,8 @@ function ProjectDetail() {
               agent={activeInstance.status.agent}
               projectId={id}
               instanceId={activeInstance.id}
+              cwd={activeInstance.path}
+              projectRoot={pwi.project.path}
             />
             <PrCard pr={activeInstance.status.pr ?? null} />
             <GitPanel git={activeInstance.status.git} projectPath={activeInstance.path} />

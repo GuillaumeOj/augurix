@@ -1,4 +1,5 @@
-import { PlusIcon, SparklesIcon } from "lucide-react";
+import { Link } from "@tanstack/react-router";
+import { PlusIcon, SettingsIcon, SparklesIcon } from "lucide-react";
 import { useState } from "react";
 import { useAllStatuses } from "@/lib/queries";
 import { AddProjectDialog } from "./add-project-dialog";
@@ -29,13 +30,22 @@ export function Sidebar() {
             </span>
           )}
         </div>
-        <button
-          onClick={() => setAddOpen(true)}
-          className="rounded-md p-1 text-[var(--color-fg-muted)] hover:bg-[var(--color-surface)] hover:text-[var(--color-fg)]"
-          title="Add project"
-        >
-          <PlusIcon size={15} />
-        </button>
+        <div className="flex items-center gap-0.5">
+          <Link
+            to="/settings"
+            className="rounded-md p-1 text-[var(--color-fg-muted)] hover:bg-[var(--color-surface)] hover:text-[var(--color-fg)] [&.active]:text-[var(--color-fg)]"
+            title="Settings"
+          >
+            <SettingsIcon size={15} />
+          </Link>
+          <button
+            onClick={() => setAddOpen(true)}
+            className="rounded-md p-1 text-[var(--color-fg-muted)] hover:bg-[var(--color-surface)] hover:text-[var(--color-fg)]"
+            title="Add project"
+          >
+            <PlusIcon size={15} />
+          </button>
+        </div>
       </div>
 
       <div className="flex-1 overflow-y-auto px-1.5 py-1.5">
