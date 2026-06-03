@@ -10,30 +10,30 @@ name = "augurix_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "=2.6.2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
-tauri-plugin-dialog = "2"
-tauri-plugin-store = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["full"] }
-sysinfo = "0.32"
-notify = "7"
-notify-debouncer-full = "0.4"
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4", "v5", "serde"] }
-futures = "0.3"
-dirs = "5"
-anyhow = "1"
-thiserror = "2"
-parking_lot = "0.12"
-wait-timeout = "0.2"
+tauri = { version = "=2.11.2", features = [] }
+tauri-plugin-opener = "=2.5.4"
+tauri-plugin-dialog = "=2.7.1"
+tauri-plugin-store = "=2.4.3"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+tokio = { version = "=1.52.3", features = ["full"] }
+sysinfo = "=0.32.1"
+notify = "=7.0.0"
+notify-debouncer-full = "=0.4.0"
+chrono = { version = "=0.4.44", features = ["serde"] }
+uuid = { version = "=1.23.1", features = ["v4", "v5", "serde"] }
+futures = "=0.3.32"
+dirs = "=5.0.1"
+anyhow = "=1.0.102"
+thiserror = "=2.0.18"
+parking_lot = "=0.12.5"
+wait-timeout = "=0.2.1"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "=3.27.0"
 
 [profile.release]
 codegen-units = 1
