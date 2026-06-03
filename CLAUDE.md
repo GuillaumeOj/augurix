@@ -54,7 +54,26 @@ Only commit once the relevant checks pass.
 
 ```bash
 git push -u origin feat/add-button
-gh pr create --base main --fill --title "<type>: <summary>"
+gh pr create --base main --assignee @me \
+  --title "<type>: <summary>" \
+  --body "$(cat <<'EOF'
+## Summary
+
+<what changed and why, in a sentence or two>
+
+## Highlights
+
+- <notable change or decision>
+- <another>
+
+## Test plan
+
+- <how it was verified — commands run, checks passed, manual steps>
+EOF
+)"
 ```
 
-PRs are opened ready-for-review against `main`.
+PRs are opened ready-for-review against `main`. Every PR:
+
+- is **assigned to the commit author** (`--assignee @me` — the author opening the PR);
+- has a **body following this fixed template**: `## Summary`, `## Highlights`, `## Test plan`.
