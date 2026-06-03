@@ -3,6 +3,7 @@ import { useNavigate } from "@tanstack/react-router";
 import {
   Loader2Icon,
   SendIcon,
+  ShieldQuestionIcon,
   SparklesIcon,
   SquareIcon,
   TerminalIcon,
@@ -10,12 +11,13 @@ import {
   WrenchIcon,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { qk, useInstanceMessages } from "@/lib/queries";
+import { qk, useInstanceMessages, useSessionPrompt } from "@/lib/queries";
 import {
   type AgentStatus,
   api,
   type PendingInteraction,
   type PendingQuestion,
+  type ScreenPrompt,
   type SessionInput,
   type TranscriptMessage,
   type UUID,
@@ -79,6 +81,7 @@ export function AgentPanel({
       await api.sendSessionInput(agent.pid, cwd, projectRoot, input);
       // The TUI advances asynchronously; refetch so the answered prompt clears.
       queryClient.invalidateQueries({ queryKey: qk.messages(projectId, instanceId) });
+      queryClient.invalidateQueries({ queryKey: qk.prompt(projectId, instanceId) });
       return true;
     } catch (e) {
       setSendError(String(e));
@@ -89,8 +92,23 @@ export function AgentPanel({
   };
 
   const list = messages.data ?? [];
-  const hasPending = list.some((m) => m.tool_uses.some((t) => t.pending));
   const canSend = agent.state !== "not-running";
+
+  // A live TUI selection prompt (permission / plan approval) read off the
+  // terminal screen — these never reach the transcript, so we scrape for them.
+  const prompt = useSessionPrompt(projectId, instanceId, agent.pid, cwd, projectRoot, canSend);
+  const screenPrompt = prompt.data ?? null;
+
+  const hasPending = list.some((m) => m.tool_uses.some((t) => t.pending));
+  // AskUserQuestion has a richer transcript card (handles multi-select, which a
+  // single digit-press can't), so let it own questions and suppress the live
+  // card then. Otherwise the live prompt is the single source of action buttons
+  // (covering permission prompts and plan approval) and the transcript cards
+  // drop theirs to avoid duplicate controls.
+  const hasPendingQuestion = list.some((m) =>
+    m.tool_uses.some((t) => t.pending?.kind === "question")
+  );
+  const liveActive = !!screenPrompt && !hasPendingQuestion;
 
   return (
     <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-elevated)]">
@@ -138,13 +156,18 @@ export function AgentPanel({
         emptyState={agent.state}
         sendInput={sendInput}
         sending={sending}
+        liveActive={liveActive}
       />
 
-      {agent.state === "running" && !hasPending && (
+      {agent.state === "running" && !hasPending && !liveActive && (
         <div className="flex items-center gap-2 border-t border-[var(--color-border)] px-4 py-2.5 text-[12px] text-[var(--color-fg-muted)]">
           <Loader2Icon size={13} className="animate-spin text-[var(--color-accent)]" />
           Claude is working…
         </div>
+      )}
+
+      {liveActive && screenPrompt && (
+        <ScreenPromptCard prompt={screenPrompt} sendInput={sendInput} sending={sending} />
       )}
 
       <ReplyComposer
@@ -162,12 +185,15 @@ function TranscriptList({
   emptyState,
   sendInput,
   sending,
+  liveActive,
 }: {
   messages: TranscriptMessage[];
   loading: boolean;
   emptyState: AgentStatus["state"];
   sendInput: SendInput;
   sending: boolean;
+  /** A live screen prompt owns the action buttons — hide the transcript ones. */
+  liveActive: boolean;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const prevSigRef = useRef<string | null>(null);
@@ -222,6 +248,7 @@ function TranscriptList({
           message={m}
           sendInput={sendInput}
           sending={sending}
+          liveActive={liveActive}
         />
       ))}
     </div>
@@ -232,10 +259,12 @@ function MessageRow({
   message,
   sendInput,
   sending,
+  liveActive,
 }: {
   message: TranscriptMessage;
   sendInput: SendInput;
   sending: boolean;
+  liveActive: boolean;
 }) {
   const isUser = message.role === "user";
   return (
@@ -272,7 +301,13 @@ function MessageRow({
           <div className="mt-1.5 flex flex-col gap-1.5">
             {message.tool_uses.map((t, i) =>
               t.pending ? (
-                <PendingCard key={i} pending={t.pending} sendInput={sendInput} sending={sending} />
+                <PendingCard
+                  key={i}
+                  pending={t.pending}
+                  sendInput={sendInput}
+                  sending={sending}
+                  hideActions={liveActive}
+                />
               ) : null
             )}
             <div className="flex flex-wrap gap-1">
@@ -291,10 +326,13 @@ function PendingCard({
   pending,
   sendInput,
   sending,
+  hideActions,
 }: {
   pending: PendingInteraction;
   sendInput: SendInput;
   sending: boolean;
+  /** Hide this card's own buttons because a live screen prompt owns the action. */
+  hideActions: boolean;
 }) {
   if (pending.kind === "plan-approval") {
     return (
@@ -303,21 +341,27 @@ function PendingCard({
           Plan — awaiting approval
         </div>
         <Markdown text={pending.plan} />
-        <div className="mt-2.5 flex gap-2">
-          <CardButton
-            primary
-            disabled={sending}
-            onClick={() => sendInput({ kind: "plan", approve: true })}
-          >
-            Approve
-          </CardButton>
-          <CardButton
-            disabled={sending}
-            onClick={() => sendInput({ kind: "plan", approve: false })}
-          >
-            Reject
-          </CardButton>
-        </div>
+        {hideActions ? (
+          <div className="mt-2 text-[11px] text-[var(--color-fg-subtle)]">
+            Choose an option below to respond.
+          </div>
+        ) : (
+          <div className="mt-2.5 flex gap-2">
+            <CardButton
+              primary
+              disabled={sending}
+              onClick={() => sendInput({ kind: "plan", approve: true })}
+            >
+              Approve
+            </CardButton>
+            <CardButton
+              disabled={sending}
+              onClick={() => sendInput({ kind: "plan", approve: false })}
+            >
+              Reject
+            </CardButton>
+          </div>
+        )}
       </div>
     );
   }
@@ -443,6 +487,55 @@ function OptionLabel({ option }: { option: PendingQuestion["options"][number] })
   );
 }
 
+/** A live selection prompt scraped off the session's terminal screen — a
+ * permission request or plan approval. Mirrors the actual on-screen options as
+ * buttons; clicking one presses that digit in the TUI. */
+function ScreenPromptCard({
+  prompt,
+  sendInput,
+  sending,
+}: {
+  prompt: ScreenPrompt;
+  sendInput: SendInput;
+  sending: boolean;
+}) {
+  return (
+    <div className="border-t border-[var(--color-border)] px-3 py-3">
+      <div className="rounded-lg border border-[var(--color-warning)]/50 bg-[var(--color-warning)]/5 p-3">
+        <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-[var(--color-warning)]">
+          <ShieldQuestionIcon size={12} />
+          Waiting for your response
+        </div>
+        {prompt.title && (
+          <div className="mb-2 text-[13px] font-medium text-[var(--color-fg)]">{prompt.title}</div>
+        )}
+        <div className="flex flex-col gap-1.5">
+          {prompt.options.map((o) => (
+            <button
+              type="button"
+              key={o.number}
+              disabled={sending}
+              onClick={() => sendInput({ kind: "screen-choice", number: o.number })}
+              className={cn(
+                "flex items-baseline gap-2 rounded-md border px-2.5 py-1.5 text-left text-[12.5px]",
+                o.selected
+                  ? "border-[var(--color-accent)] bg-[var(--color-accent)]/10"
+                  : "border-[var(--color-border)] hover:border-[var(--color-accent)] hover:bg-[var(--color-accent)]/10",
+                sending && "opacity-50 cursor-not-allowed"
+              )}
+            >
+              <span className="font-mono text-[var(--color-fg-subtle)]">{o.number}.</span>
+              <span className="text-[var(--color-fg)]">{o.label}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const REPLY_MAX_HEIGHT = 220; // ~10 lines, then the textarea scrolls.
+
 function ReplyComposer({
   disabled,
   sending,
@@ -453,20 +546,34 @@ function ReplyComposer({
   onSend: (text: string) => Promise<boolean>;
 }) {
   const [text, setText] = useState("");
+  const taRef = useRef<HTMLTextAreaElement>(null);
+
+  // Grow with content up to REPLY_MAX_HEIGHT, then scroll.
+  const autoGrow = (el: HTMLTextAreaElement) => {
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, REPLY_MAX_HEIGHT)}px`;
+  };
 
   const submit = async () => {
     const t = text.trim();
     if (!t || disabled || sending) return;
     const ok = await onSend(t);
-    if (ok) setText("");
+    if (ok) {
+      setText("");
+      if (taRef.current) taRef.current.style.height = "auto";
+    }
   };
 
   return (
     <div className="flex items-end gap-2 border-t border-[var(--color-border)] px-3 py-3">
       <textarea
+        ref={taRef}
         value={text}
         disabled={disabled || sending}
-        onChange={(e) => setText(e.target.value)}
+        onChange={(e) => {
+          setText(e.target.value);
+          autoGrow(e.currentTarget);
+        }}
         onKeyDown={(e) => {
           if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
             e.preventDefault();
@@ -475,8 +582,9 @@ function ReplyComposer({
         }}
         rows={1}
         placeholder={disabled ? "No running session to reply to" : "Reply to Claude… (⌘↵ to send)"}
+        style={{ maxHeight: REPLY_MAX_HEIGHT }}
         className={cn(
-          "flex-1 resize-none rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-[12.5px] text-[var(--color-fg)]",
+          "flex-1 resize-none overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-[12.5px] text-[var(--color-fg)]",
           "placeholder:text-[var(--color-fg-subtle)] focus:border-[var(--color-accent)] focus:outline-none",
           (disabled || sending) && "opacity-50"
         )}

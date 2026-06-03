@@ -103,11 +103,26 @@ export interface ToolUseEntry {
   pending?: PendingInteraction | null;
 }
 
+export interface ScreenPromptOption {
+  number: number;
+  label: string;
+  /** True for the option the TUI cursor (❯) currently sits on. */
+  selected: boolean;
+}
+
+/** A selection prompt scraped from the session's live terminal screen — e.g. a
+ * permission request or plan-approval prompt that never reaches the transcript. */
+export interface ScreenPrompt {
+  title: string | null;
+  options: ScreenPromptOption[];
+}
+
 /** What to send into a running Claude Code session. Mirrors the Rust enum. */
 export type SessionInput =
   | { kind: "text"; text: string }
   | { kind: "option"; indices: number[]; multi_select: boolean }
-  | { kind: "plan"; approve: boolean };
+  | { kind: "plan"; approve: boolean }
+  | { kind: "screen-choice"; number: number };
 
 export interface TranscriptMessage {
   /** `null` if the source entry had no timestamp; never fabricated. */
@@ -200,4 +215,6 @@ export const api = {
     projectRoot: string | null,
     input: SessionInput
   ) => invoke<void>("send_session_input", { pid, cwd, projectRoot, input }),
+  readSessionPrompt: (pid: number | null, cwd: string, projectRoot: string | null) =>
+    invoke<ScreenPrompt | null>("read_session_prompt", { pid, cwd, projectRoot }),
 };

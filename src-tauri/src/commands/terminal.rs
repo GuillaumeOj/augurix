@@ -11,6 +11,7 @@
 use crate::caches::SharedCaches;
 use crate::proc::{run_capturing, run_with_stdin};
 use crate::settings::{Settings, SettingsStore, TerminalChoice};
+use crate::types::{ScreenPrompt, ScreenPromptOption};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -236,6 +237,9 @@ pub enum SessionInput {
     },
     /// Approve or reject a plan (`ExitPlanMode`).
     Plan { approve: bool },
+    /// Pick a numbered option in a live TUI selection prompt (permission /
+    /// plan-approval / etc.) by pressing its digit — see [`ScreenPrompt`].
+    ScreenChoice { number: u32 },
 }
 
 /// One key event to deliver to the TUI. Kept abstract so each terminal backend
@@ -266,6 +270,9 @@ fn render_events(input: &SessionInput) -> Vec<KeyEvent> {
                 vec![KeyEvent::Down, KeyEvent::Enter]
             }
         }
+        // Selection prompts act on the digit immediately — no relative cursor
+        // math, no trailing Enter.
+        SessionInput::ScreenChoice { number } => vec![KeyEvent::Literal(number.to_string())],
     }
 }
 
@@ -328,6 +335,231 @@ pub fn send_session_input(
         TerminalChoice::AppleTerminal => send_system_events_terminal("Terminal", pid, &events),
         TerminalChoice::Iterm2 => send_system_events_terminal("iTerm", pid, &events),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Read a live TUI selection prompt off the session's screen
+// ---------------------------------------------------------------------------
+
+/// Detect a selection prompt (permission request, plan approval, …) currently
+/// drawn in the session's terminal. These prompts are TUI-only — they never
+/// reach the JSONL transcript — so we scrape the live screen and parse it.
+/// Returns `None` when no terminal is configured, the window can't be matched,
+/// or no prompt is on screen. Never steals focus.
+#[tauri::command]
+pub fn read_session_prompt(
+    settings: State<SharedSettings>,
+    caches: State<SharedCaches>,
+    pid: Option<u32>,
+    cwd: String,
+    project_root: Option<String>,
+) -> Option<ScreenPrompt> {
+    let choice = settings.get().terminal?;
+
+    // Resolve the session pid the same way `send_session_input` does.
+    let pid = match (pid, project_root.as_deref()) {
+        (Some(p), _) => Some(p),
+        (None, Some(root)) => {
+            let snap = caches.snapshot_processes();
+            crate::commands::agents::find_session_process(Path::new(&cwd), Path::new(root), &snap)
+        }
+        (None, None) => None,
+    };
+
+    let screen = read_session_screen(choice, pid, &cwd)?;
+    parse_screen_prompt(&screen)
+}
+
+/// Capture the visible terminal text for the session, per terminal backend.
+fn read_session_screen(choice: TerminalChoice, pid: Option<u32>, cwd: &str) -> Option<String> {
+    match choice {
+        TerminalChoice::Kitty => read_kitty_screen(pid, cwd),
+        TerminalChoice::AppleTerminal => read_apple_screen("Terminal", pid),
+        TerminalChoice::Iterm2 => read_apple_screen("iTerm", pid),
+    }
+}
+
+/// kitty: `get-text` on the matched window. Doesn't activate or focus it.
+fn read_kitty_screen(pid: Option<u32>, cwd: &str) -> Option<String> {
+    let bin = kitty_bin()?;
+    for sock in kitty_sockets() {
+        let to = format!("unix:{}", sock.display());
+        let ls = match run_capturing(
+            &bin,
+            &["@", "--to", &to, "ls"],
+            Path::new("/"),
+            TERM_TIMEOUT,
+        ) {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        if let Some(window_id) = find_kitty_window(&ls, pid, cwd) {
+            let match_arg = format!("id:{window_id}");
+            if let Ok(text) = run_capturing(
+                &bin,
+                &["@", "--to", &to, "get-text", "--match", &match_arg],
+                Path::new("/"),
+                TERM_TIMEOUT,
+            ) {
+                return non_blank(text);
+            }
+        }
+    }
+    None
+}
+
+/// Apple Terminal / iTerm2: read the visible text of the tab/session whose tty
+/// matches via AppleScript. No `activate`, so focus is never stolen.
+fn read_apple_screen(app: &str, pid: Option<u32>) -> Option<String> {
+    let tty = pid.and_then(tty_for_pid)?;
+    let out = run_osascript(&screen_contents_script(app, &tty)).ok()?;
+    non_blank(out)
+}
+
+/// AppleScript returning the visible contents of the tab/session whose tty
+/// matches `tty`, or "" if none matched.
+fn screen_contents_script(app: &str, tty: &str) -> String {
+    if app == "iTerm" {
+        format!(
+            r#"tell application "iTerm"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                try
+                    if tty of s is "{tty}" then return (text of s)
+                end try
+            end repeat
+        end repeat
+    end repeat
+end tell
+return """#
+        )
+    } else {
+        format!(
+            r#"tell application "Terminal"
+    set targetTTY to "{tty}"
+    repeat with w in windows
+        repeat with t in tabs of w
+            try
+                if tty of t is targetTTY then return (contents of t)
+            end try
+        end repeat
+    end repeat
+end tell
+return """#
+        )
+    }
+}
+
+fn non_blank(s: String) -> Option<String> {
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Box-drawing / pointer glyphs we strip or treat specially while parsing.
+const BORDER_CHARS: &[char] = &['│', '┃', '┆', '┊', '╎', '║', '|', '╮', '╭', '╰', '╯'];
+const CURSOR_MARKERS: &[&str] = &["❯", "►", "▶", "●", ">"];
+
+/// Strip a leading/trailing box border and surrounding whitespace from a line.
+fn clean_line(raw: &str) -> String {
+    let mut s = raw.trim();
+    // Peel one leading border char (then any whitespace) — boxes use a single
+    // vertical border, e.g. "│ ❯ 1. Yes".
+    if let Some(first) = s.chars().next() {
+        if BORDER_CHARS.contains(&first) {
+            s = s[first.len_utf8()..].trim_start();
+        }
+    }
+    if let Some(last) = s.chars().last() {
+        if BORDER_CHARS.contains(&last) {
+            s = s[..s.len() - last.len_utf8()].trim_end();
+        }
+    }
+    s.trim().to_string()
+}
+
+/// True for lines that carry no prompt content (blank or only separators).
+fn is_separator(line: &str) -> bool {
+    line.is_empty()
+        || line
+            .chars()
+            .all(|c| c.is_whitespace() || BORDER_CHARS.contains(&c) || matches!(c, '─' | '━' | '-'))
+}
+
+/// Parse one cleaned line as `[cursor] <n>. <label>`, returning
+/// `(selected, number, label)`. The cursor marker (`❯`) sets `selected`.
+fn parse_option_line(line: &str) -> Option<(bool, u32, String)> {
+    let mut rest = line.trim_start();
+    let mut selected = false;
+    for marker in CURSOR_MARKERS {
+        if let Some(r) = rest.strip_prefix(marker) {
+            selected = true;
+            rest = r.trim_start();
+            break;
+        }
+    }
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || digits.len() > 3 {
+        return None;
+    }
+    let number: u32 = digits.parse().ok()?;
+    let after = rest[digits.len()..].strip_prefix('.')?;
+    // Require a space (or end) after the dot so "1.5x" isn't mistaken for an option.
+    if !after.is_empty() && !after.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let label = after.trim();
+    if label.is_empty() {
+        return None;
+    }
+    Some((selected, number, label.to_string()))
+}
+
+/// Detect a selection prompt in scraped screen text. Looks for the last block
+/// of consecutive numbered option lines that includes the TUI cursor (`❯`) and
+/// has at least two options — a strong guard against ordinary numbered lists in
+/// Claude's prose. The title is the nearest non-separator line above the block.
+fn parse_screen_prompt(screen: &str) -> Option<ScreenPrompt> {
+    let lines: Vec<String> = screen.lines().map(clean_line).collect();
+
+    // Walk bottom-up to find the last run of consecutive option lines.
+    let mut end = lines.len();
+    while end > 0 {
+        if parse_option_line(&lines[end - 1]).is_some() {
+            // Extend the run upward through consecutive option lines.
+            let mut start = end - 1;
+            while start > 0 && parse_option_line(&lines[start - 1]).is_some() {
+                start -= 1;
+            }
+            let options: Vec<ScreenPromptOption> = lines[start..end]
+                .iter()
+                .filter_map(|l| parse_option_line(l))
+                .map(|(selected, number, label)| ScreenPromptOption {
+                    number,
+                    label,
+                    selected,
+                })
+                .collect();
+
+            let has_cursor = options.iter().any(|o| o.selected);
+            if options.len() >= 2 && has_cursor {
+                let title = (0..start)
+                    .rev()
+                    .map(|i| lines[i].as_str())
+                    .find(|l| !is_separator(l))
+                    .map(str::to_string);
+                return Some(ScreenPrompt { title, options });
+            }
+            // Not a real prompt; keep scanning above this run.
+            end = start;
+        } else {
+            end -= 1;
+        }
+    }
+    None
 }
 
 /// kitty: send the rendered bytes to the matched window via remote control.
@@ -1011,6 +1243,85 @@ mod tests {
             render_events(&SessionInput::Plan { approve: false }),
             vec![KeyEvent::Down, KeyEvent::Enter]
         );
+    }
+
+    #[test]
+    fn render_screen_choice_sends_digit_only() {
+        assert_eq!(
+            render_events(&SessionInput::ScreenChoice { number: 2 }),
+            vec![KeyEvent::Literal("2".into())]
+        );
+        // No trailing Enter — the TUI acts on the digit immediately.
+        assert_eq!(
+            render_events(&SessionInput::ScreenChoice { number: 10 }),
+            vec![KeyEvent::Literal("10".into())]
+        );
+    }
+
+    #[test]
+    fn parses_permission_prompt() {
+        let screen = "\
+some earlier output line
+╭──────────────────────────────────────────────╮
+│ Bash command                                   │
+│                                                │
+│ Do you want to proceed?                        │
+│ ❯ 1. Yes                                       │
+│   2. Yes, and don't ask again for ls commands  │
+│   3. No, and tell Claude what to do (esc)      │
+╰──────────────────────────────────────────────╯";
+        let p = parse_screen_prompt(screen).expect("prompt");
+        assert_eq!(p.title.as_deref(), Some("Do you want to proceed?"));
+        assert_eq!(p.options.len(), 3);
+        assert_eq!(p.options[0].number, 1);
+        assert_eq!(p.options[0].label, "Yes");
+        assert!(p.options[0].selected);
+        assert!(!p.options[1].selected);
+        assert_eq!(p.options[2].number, 3);
+        assert!(p.options[2].label.starts_with("No, and tell Claude"));
+    }
+
+    #[test]
+    fn parses_plan_approval_prompt() {
+        let screen = "\
+│ Ready to code?                        │
+│ ❯ 1. Yes, and auto-accept edits       │
+│   2. Yes, and manually approve edits  │
+│   3. No, keep planning                │";
+        let p = parse_screen_prompt(screen).expect("prompt");
+        assert_eq!(p.title.as_deref(), Some("Ready to code?"));
+        assert_eq!(p.options.len(), 3);
+        assert_eq!(p.options[1].label, "Yes, and manually approve edits");
+        assert_eq!(p.options[2].label, "No, keep planning");
+    }
+
+    #[test]
+    fn no_prompt_when_no_cursor() {
+        // An ordinary numbered list in Claude's prose — no cursor glyph.
+        let screen = "Here is the plan:\n1. First do this\n2. Then do that\n3. Finally this";
+        assert!(parse_screen_prompt(screen).is_none());
+    }
+
+    #[test]
+    fn no_prompt_on_idle_screen() {
+        let screen = "❯ run the tests\n  Context: 10.0%                      101476 tokens";
+        assert!(parse_screen_prompt(screen).is_none());
+    }
+
+    #[test]
+    fn picks_the_bottom_most_prompt_block() {
+        // A numbered list higher up must not be mistaken for the live prompt.
+        let screen = "\
+1. old item
+2. another old item
+
+│ Do you want to proceed?      │
+│ ❯ 1. Yes                     │
+│   2. No                      │";
+        let p = parse_screen_prompt(screen).expect("prompt");
+        assert_eq!(p.title.as_deref(), Some("Do you want to proceed?"));
+        assert_eq!(p.options.len(), 2);
+        assert!(p.options[0].selected);
     }
 
     #[test]

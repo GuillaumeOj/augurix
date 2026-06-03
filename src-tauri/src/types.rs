@@ -189,6 +189,27 @@ pub enum PendingInteraction {
     PlanApproval { plan: String },
 }
 
+/// One numbered choice in a live TUI selection prompt (see [`ScreenPrompt`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScreenPromptOption {
+    /// The 1-based number shown in the TUI; this is what we send to select it.
+    pub number: u32,
+    pub label: String,
+    /// True for the option the TUI cursor (`❯`) currently sits on.
+    pub selected: bool,
+}
+
+/// A selection prompt read from the session's live terminal screen — e.g. a
+/// permission request or a plan-approval prompt. These are drawn only in the
+/// TUI (never written to the transcript), so they're detected by scraping the
+/// screen rather than parsing JSONL.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScreenPrompt {
+    /// The question/headline above the options, if one was found.
+    pub title: Option<String>,
+    pub options: Vec<ScreenPromptOption>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
