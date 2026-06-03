@@ -9,7 +9,7 @@
 //!     `foreground_processes`; we match our `pid` then `kitty @ focus-window`.
 
 use crate::caches::SharedCaches;
-use crate::proc::run_capturing;
+use crate::proc::{run_capturing, run_with_stdin};
 use crate::settings::{Settings, SettingsStore, TerminalChoice};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -215,6 +215,285 @@ pub fn open_terminal(
         TerminalChoice::AppleTerminal => focus_apple_terminal(pid, &cwd),
         TerminalChoice::Iterm2 => focus_iterm2(pid, &cwd),
         TerminalChoice::Kitty => focus_kitty(pid, &cwd),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Send input to a running session
+// ---------------------------------------------------------------------------
+
+/// What the user wants to send into the running Claude Code session.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum SessionInput {
+    /// A free-text reply: type `text`, then Enter.
+    Text { text: String },
+    /// Select option(s) in the current `AskUserQuestion` list (0-based), then
+    /// confirm. `multi_select` toggles each with Space before the final Enter.
+    Option {
+        indices: Vec<u32>,
+        multi_select: bool,
+    },
+    /// Approve or reject a plan (`ExitPlanMode`).
+    Plan { approve: bool },
+}
+
+/// One key event to deliver to the TUI. Kept abstract so each terminal backend
+/// can render it in its own way (kitty escape bytes vs. AppleScript key codes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyEvent {
+    Literal(String),
+    Down,
+    Space,
+    Enter,
+}
+
+/// Translate a [`SessionInput`] into an ordered list of key events. The claude
+/// TUI's selectable list starts with the cursor on option 0; we move down with
+/// relative deltas, toggle/confirm with Space/Enter.
+fn render_events(input: &SessionInput) -> Vec<KeyEvent> {
+    match input {
+        SessionInput::Text { text } => vec![KeyEvent::Literal(text.clone()), KeyEvent::Enter],
+        SessionInput::Option {
+            indices,
+            multi_select,
+        } => render_option_events(indices, *multi_select),
+        // The plan prompt defaults to "Yes, proceed"; reject moves down one.
+        SessionInput::Plan { approve } => {
+            if *approve {
+                vec![KeyEvent::Enter]
+            } else {
+                vec![KeyEvent::Down, KeyEvent::Enter]
+            }
+        }
+    }
+}
+
+fn render_option_events(indices: &[u32], multi_select: bool) -> Vec<KeyEvent> {
+    let mut idx: Vec<u32> = indices.to_vec();
+    idx.sort_unstable();
+    idx.dedup();
+    let mut events = Vec::new();
+    if multi_select {
+        let mut cursor = 0u32;
+        for &target in &idx {
+            for _ in cursor..target {
+                events.push(KeyEvent::Down);
+            }
+            events.push(KeyEvent::Space);
+            cursor = target;
+        }
+        events.push(KeyEvent::Enter);
+    } else {
+        let target = idx.first().copied().unwrap_or(0);
+        for _ in 0..target {
+            events.push(KeyEvent::Down);
+        }
+        events.push(KeyEvent::Enter);
+    }
+    events
+}
+
+/// Inject the user's answer/reply into the terminal hosting the session.
+///
+/// Always targets the *matched* window/tab and refuses to send if no match is
+/// found — typing a reply into the wrong shell would be dangerous.
+#[tauri::command]
+pub fn send_session_input(
+    settings: State<SharedSettings>,
+    caches: State<SharedCaches>,
+    pid: Option<u32>,
+    cwd: String,
+    project_root: Option<String>,
+    input: SessionInput,
+) -> Result<(), String> {
+    let choice = settings
+        .get()
+        .terminal
+        .ok_or_else(|| "No terminal configured — pick one in Settings first.".to_string())?;
+
+    // Resolve the session pid the same way `open_terminal` does.
+    let pid = match (pid, project_root.as_deref()) {
+        (Some(p), _) => Some(p),
+        (None, Some(root)) => {
+            let snap = caches.snapshot_processes();
+            crate::commands::agents::find_session_process(Path::new(&cwd), Path::new(root), &snap)
+        }
+        (None, None) => None,
+    };
+
+    let events = render_events(&input);
+    match choice {
+        TerminalChoice::Kitty => send_kitty(pid, &cwd, &events),
+        TerminalChoice::AppleTerminal => send_system_events_terminal("Terminal", pid, &events),
+        TerminalChoice::Iterm2 => send_system_events_terminal("iTerm", pid, &events),
+    }
+}
+
+/// kitty: send the rendered bytes to the matched window via remote control.
+/// Does not steal focus — `send-text` works without activating the window.
+fn send_kitty(pid: Option<u32>, cwd: &str, events: &[KeyEvent]) -> Result<(), String> {
+    let bin = kitty_bin().ok_or_else(|| "kitty executable not found".to_string())?;
+    let payload = events_to_kitty_bytes(events);
+
+    let mut reachable = false;
+    for sock in kitty_sockets() {
+        let to = format!("unix:{}", sock.display());
+        let ls = match run_capturing(
+            &bin,
+            &["@", "--to", &to, "ls"],
+            Path::new("/"),
+            TERM_TIMEOUT,
+        ) {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        reachable = true;
+        if let Some(window_id) = find_kitty_window(&ls, pid, cwd) {
+            let match_arg = format!("id:{window_id}");
+            run_with_stdin(
+                &bin,
+                &[
+                    "@",
+                    "--to",
+                    &to,
+                    "send-text",
+                    "--match",
+                    &match_arg,
+                    "--stdin",
+                ],
+                Path::new("/"),
+                TERM_TIMEOUT,
+                &payload,
+            )?;
+            return Ok(());
+        }
+    }
+
+    if reachable {
+        Err("Couldn't find the kitty window for this session — is it still running?".into())
+    } else {
+        Err("kitty remote control isn't reachable — run setup in Settings.".into())
+    }
+}
+
+/// Build the raw byte stream kitty's `send-text --stdin` should deliver.
+fn events_to_kitty_bytes(events: &[KeyEvent]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for e in events {
+        match e {
+            KeyEvent::Literal(s) => out.extend_from_slice(s.as_bytes()),
+            KeyEvent::Down => out.extend_from_slice(b"\x1b[B"),
+            KeyEvent::Space => out.push(b' '),
+            KeyEvent::Enter => out.push(b'\r'),
+        }
+    }
+    out
+}
+
+/// Apple Terminal / iTerm2: select the matching tab, activate the app, then
+/// drive it with System Events keystrokes. Requires Accessibility permission.
+fn send_system_events_terminal(
+    app: &str,
+    pid: Option<u32>,
+    events: &[KeyEvent],
+) -> Result<(), String> {
+    let tty = pid.and_then(tty_for_pid).ok_or_else(|| {
+        "Couldn't resolve the session's terminal (no controlling tty).".to_string()
+    })?;
+
+    // Step 1: focus the matching tab. Refuse to proceed on no match.
+    let select = select_tab_script(app, &tty);
+    match run_osascript(&select) {
+        Ok(out) if out.trim() == "ok" => {}
+        Ok(_) => return Err(format!("Couldn't find the {app} tab for this session.",)),
+        Err(e) => return Err(map_osascript_err(e)),
+    }
+
+    // Step 2: send the keystrokes to the now-frontmost app.
+    let script = system_events_script(app, events);
+    run_osascript(&script)
+        .map(|_| ())
+        .map_err(map_osascript_err)
+}
+
+/// AppleScript that selects the tab/session whose tty matches and brings it to
+/// the front, echoing "ok"/"nomatch".
+fn select_tab_script(app: &str, tty: &str) -> String {
+    if app == "iTerm" {
+        format!(
+            r#"tell application "iTerm"
+    activate
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                try
+                    if tty of s is "{tty}" then
+                        tell s to select
+                        return "ok"
+                    end if
+                end try
+            end repeat
+        end repeat
+    end repeat
+end tell
+return "nomatch""#
+        )
+    } else {
+        format!(
+            r#"tell application "Terminal"
+    activate
+    set targetTTY to "{tty}"
+    repeat with w in windows
+        repeat with t in tabs of w
+            try
+                if tty of t is targetTTY then
+                    set selected of t to true
+                    set frontmost of w to true
+                    return "ok"
+                end if
+            end try
+        end repeat
+    end repeat
+end tell
+return "nomatch""#
+        )
+    }
+}
+
+/// AppleScript that re-activates `app` then emits the key events via System
+/// Events. Small delays guard against dropped keys in the TUI.
+fn system_events_script(app: &str, events: &[KeyEvent]) -> String {
+    let mut body = String::new();
+    for e in events {
+        match e {
+            KeyEvent::Literal(s) => {
+                body.push_str(&format!("    keystroke \"{}\"\n", applescript_escape(s)));
+            }
+            KeyEvent::Down => body.push_str("    key code 125\n    delay 0.04\n"),
+            KeyEvent::Space => body.push_str("    key code 49\n    delay 0.04\n"),
+            KeyEvent::Enter => body.push_str("    delay 0.05\n    key code 36\n"),
+        }
+    }
+    format!(
+        "tell application \"{app}\" to activate\ndelay 0.12\ntell application \"System Events\"\n{body}end tell"
+    )
+}
+
+/// Map an osascript error to a friendlier message, calling out the most common
+/// cause: missing Accessibility/Automation permission.
+fn map_osascript_err(e: String) -> String {
+    let lower = e.to_lowercase();
+    if lower.contains("-1719")
+        || lower.contains("not allowed")
+        || lower.contains("assistive")
+        || lower.contains("accessibility")
+    {
+        "macOS blocked keystrokes — grant Augurix Accessibility permission in \
+         System Settings → Privacy & Security → Accessibility, then try again."
+            .into()
+    } else {
+        e
     }
 }
 
@@ -676,6 +955,70 @@ mod tests {
         assert_eq!(applescript_escape("/a/b"), "/a/b");
         assert_eq!(applescript_escape(r#"/a "x"/b"#), r#"/a \"x\"/b"#);
         assert_eq!(applescript_escape(r"/a\b"), r"/a\\b");
+    }
+
+    #[test]
+    fn render_text_reply() {
+        let ev = render_events(&SessionInput::Text {
+            text: "hello".into(),
+        });
+        assert_eq!(ev, vec![KeyEvent::Literal("hello".into()), KeyEvent::Enter]);
+    }
+
+    #[test]
+    fn render_single_option_navigates_down() {
+        let ev = render_events(&SessionInput::Option {
+            indices: vec![2],
+            multi_select: false,
+        });
+        assert_eq!(ev, vec![KeyEvent::Down, KeyEvent::Down, KeyEvent::Enter]);
+    }
+
+    #[test]
+    fn render_first_option_is_just_enter() {
+        let ev = render_events(&SessionInput::Option {
+            indices: vec![0],
+            multi_select: false,
+        });
+        assert_eq!(ev, vec![KeyEvent::Enter]);
+    }
+
+    #[test]
+    fn render_multi_select_toggles_each() {
+        let ev = render_events(&SessionInput::Option {
+            indices: vec![0, 2],
+            multi_select: true,
+        });
+        assert_eq!(
+            ev,
+            vec![
+                KeyEvent::Space,
+                KeyEvent::Down,
+                KeyEvent::Down,
+                KeyEvent::Space,
+                KeyEvent::Enter
+            ]
+        );
+    }
+
+    #[test]
+    fn render_plan_approve_and_reject() {
+        assert_eq!(
+            render_events(&SessionInput::Plan { approve: true }),
+            vec![KeyEvent::Enter]
+        );
+        assert_eq!(
+            render_events(&SessionInput::Plan { approve: false }),
+            vec![KeyEvent::Down, KeyEvent::Enter]
+        );
+    }
+
+    #[test]
+    fn kitty_bytes_encode_escape_sequences() {
+        let bytes = events_to_kitty_bytes(&[KeyEvent::Down, KeyEvent::Enter]);
+        assert_eq!(bytes, b"\x1b[B\r");
+        let text = events_to_kitty_bytes(&[KeyEvent::Literal("hi".into()), KeyEvent::Enter]);
+        assert_eq!(text, b"hi\r");
     }
 
     #[test]

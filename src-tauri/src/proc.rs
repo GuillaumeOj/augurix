@@ -1,7 +1,7 @@
 //! Subprocess helper with a wall-clock timeout — protects the blocking thread
 //! pool from hung external commands (`git`, `gh`).
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -34,6 +34,57 @@ pub fn run_capturing(
         None => {
             // Killing on timeout is best-effort: if it fails the child becomes a
             // zombie, but we will not block this thread further.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{program} timed out after {}s", timeout.as_secs()));
+        }
+    };
+
+    let mut stdout = String::new();
+    if let Some(mut s) = child.stdout.take() {
+        let _ = s.read_to_string(&mut stdout);
+    }
+    if !status.success() {
+        let mut stderr = String::new();
+        if let Some(mut s) = child.stderr.take() {
+            let _ = s.read_to_string(&mut stderr);
+        }
+        return Err(stderr.trim().to_string());
+    }
+    Ok(stdout)
+}
+
+/// Like [`run_capturing`], but writes `stdin` to the child's standard input
+/// first. Used to feed arbitrary text (e.g. a reply body with special
+/// characters/newlines) to `kitty @ send-text --stdin` without arg-escaping.
+pub fn run_with_stdin(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout: Duration,
+    stdin: &[u8],
+) -> Result<String, String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn {program}: {e}"))?;
+
+    // Write and drop stdin before waiting so the child sees EOF and can exit.
+    if let Some(mut s) = child.stdin.take() {
+        s.write_all(stdin)
+            .map_err(|e| format!("writing stdin to {program}: {e}"))?;
+    }
+
+    let status = match child
+        .wait_timeout(timeout)
+        .map_err(|e| format!("wait_timeout failed: {e}"))?
+    {
+        Some(s) => s,
+        None => {
             let _ = child.kill();
             let _ = child.wait();
             return Err(format!("{program} timed out after {}s", timeout.as_secs()));

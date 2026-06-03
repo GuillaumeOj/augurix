@@ -156,6 +156,37 @@ pub struct ProjectWithInstances {
 pub struct ToolUseEntry {
     pub name: String,
     pub detail: Option<String>,
+    /// The `tool_use` id, set only for interactive tools we may answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
+    /// Present only when this `tool_use` is an UNANSWERED interactive prompt
+    /// (no matching `tool_result` later in the transcript).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingInteraction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingQuestion {
+    pub header: Option<String>,
+    pub question: String,
+    pub multi_select: bool,
+    pub options: Vec<QuestionOption>,
+}
+
+/// An interactive prompt from Claude Code that is awaiting the user's answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "kind")]
+pub enum PendingInteraction {
+    /// `AskUserQuestion` — one or more structured questions.
+    Question { questions: Vec<PendingQuestion> },
+    /// `ExitPlanMode` — a plan markdown awaiting yes/no approval.
+    PlanApproval { plan: String },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

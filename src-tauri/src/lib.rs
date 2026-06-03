@@ -66,6 +66,7 @@ pub fn run() {
             commands::terminal::detect_terminals,
             commands::terminal::setup_kitty,
             commands::terminal::open_terminal,
+            commands::terminal::send_session_input,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,10 +1,12 @@
 use crate::caches::ProcessSnapshot;
 use crate::claude_path::{claude_projects_root, encoded_path};
 use crate::types::{
-    AgentKind, AgentState, AgentStatus, MessageRole, ToolUseEntry, TranscriptMessage,
+    AgentKind, AgentState, AgentStatus, MessageRole, PendingInteraction, PendingQuestion,
+    QuestionOption, ToolUseEntry, TranscriptMessage,
 };
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -425,6 +427,10 @@ pub fn read_recent_messages(path: &Path, limit: usize) -> Vec<TranscriptMessage>
 
 /// Pure parser: given JSONL transcript lines, return the most recent up-to-`limit` messages.
 pub fn parse_messages_from_lines(lines: &[String], limit: usize) -> Vec<TranscriptMessage> {
+    // Pre-scan: collect every tool_use id that has a matching tool_result later
+    // in the window, so we can tell whether an interactive prompt was answered.
+    let answered = collect_answered_tool_use_ids(lines);
+
     let mut out: Vec<TranscriptMessage> = Vec::with_capacity(lines.len());
     for line in lines.iter() {
         let Ok(entry) = serde_json::from_str::<TranscriptEntry>(line) else {
@@ -454,7 +460,7 @@ pub fn parse_messages_from_lines(lines: &[String], limit: usize) -> Vec<Transcri
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|d| d.with_timezone(&Utc));
 
-        let (text, tools, only_tool_results) = extract_message_parts(&entry);
+        let (text, tools, only_tool_results) = extract_message_parts(&entry, &answered);
 
         // Skip noise: user entries that are only tool_results
         if role == MessageRole::User && text.is_none() && only_tool_results {
@@ -479,7 +485,99 @@ pub fn parse_messages_from_lines(lines: &[String], limit: usize) -> Vec<Transcri
     out
 }
 
-fn extract_message_parts(entry: &TranscriptEntry) -> (Option<String>, Vec<ToolUseEntry>, bool) {
+/// Scan every line for user-side `tool_result` items and return the set of
+/// `tool_use_id`s they answer. Used to tell whether an interactive prompt
+/// (AskUserQuestion / ExitPlanMode) is still awaiting the user.
+fn collect_answered_tool_use_ids(lines: &[String]) -> HashSet<String> {
+    let mut answered = HashSet::new();
+    for line in lines.iter() {
+        let Ok(entry) = serde_json::from_str::<TranscriptEntry>(line) else {
+            continue;
+        };
+        let Some(value) = entry.message.as_ref().or(entry.content.as_ref()) else {
+            continue;
+        };
+        let content = value.get("content").unwrap_or(value);
+        let Some(arr) = content.as_array() else {
+            continue;
+        };
+        for item in arr {
+            if item.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
+                if let Some(id) = item.get("tool_use_id").and_then(|v| v.as_str()) {
+                    answered.insert(id.to_string());
+                }
+            }
+        }
+    }
+    answered
+}
+
+/// Build the pending-interaction payload for an interactive `tool_use`, unless
+/// it was already answered (its id appears in `answered`).
+fn pending_interaction(
+    name: &str,
+    id: Option<&str>,
+    input: Option<&serde_json::Value>,
+    answered: &HashSet<String>,
+) -> Option<PendingInteraction> {
+    if id.map(|i| answered.contains(i)).unwrap_or(false) {
+        return None;
+    }
+    match name {
+        "AskUserQuestion" => parse_ask_user_question(input),
+        "ExitPlanMode" => parse_exit_plan_mode(input),
+        _ => None,
+    }
+}
+
+fn parse_ask_user_question(input: Option<&serde_json::Value>) -> Option<PendingInteraction> {
+    let qs = input?.get("questions")?.as_array()?;
+    let questions: Vec<PendingQuestion> = qs
+        .iter()
+        .filter_map(|q| {
+            let question = q.get("question")?.as_str()?.to_string();
+            let header = q.get("header").and_then(|v| v.as_str()).map(str::to_string);
+            let multi_select = q
+                .get("multiSelect")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let options = q
+                .get("options")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|o| {
+                            Some(QuestionOption {
+                                label: o.get("label")?.as_str()?.to_string(),
+                                description: o
+                                    .get("description")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(PendingQuestion {
+                header,
+                question,
+                multi_select,
+                options,
+            })
+        })
+        .collect();
+    (!questions.is_empty()).then_some(PendingInteraction::Question { questions })
+}
+
+fn parse_exit_plan_mode(input: Option<&serde_json::Value>) -> Option<PendingInteraction> {
+    let plan = input?.get("plan")?.as_str()?.to_string();
+    Some(PendingInteraction::PlanApproval { plan })
+}
+
+fn extract_message_parts(
+    entry: &TranscriptEntry,
+    answered: &HashSet<String>,
+) -> (Option<String>, Vec<ToolUseEntry>, bool) {
     let mut text: Option<String> = None;
     let mut tools: Vec<ToolUseEntry> = Vec::new();
     let mut only_tool_results = true;
@@ -522,8 +620,16 @@ fn extract_message_parts(entry: &TranscriptEntry) -> (Option<String>, Vec<ToolUs
                         .and_then(|v| v.as_str())
                         .unwrap_or("Tool")
                         .to_string();
+                    let id = item.get("id").and_then(|v| v.as_str()).map(str::to_string);
                     let detail = tool_detail(&name, item.get("input"));
-                    tools.push(ToolUseEntry { name, detail });
+                    let pending =
+                        pending_interaction(&name, id.as_deref(), item.get("input"), answered);
+                    tools.push(ToolUseEntry {
+                        name,
+                        detail,
+                        tool_use_id: id,
+                        pending,
+                    });
                 }
                 "tool_result" => {
                     // user-side tool_results — keep only_tool_results truthy
@@ -571,6 +677,14 @@ fn tool_detail(name: &str, input: Option<&serde_json::Value>) -> Option<String> 
         "WebFetch" => pick("url"),
         "WebSearch" => pick("query"),
         "Task" | "Agent" => pick("description"),
+        "AskUserQuestion" => input
+            .get("questions")
+            .and_then(|q| q.as_array())
+            .and_then(|a| a.first())
+            .and_then(|q| q.get("header").or_else(|| q.get("question")))
+            .and_then(|v| v.as_str())
+            .map(|s| truncate(s, 60)),
+        "ExitPlanMode" => Some("Review plan".to_string()),
         _ => None,
     }
 }
@@ -753,5 +867,86 @@ mod tests {
         let input = serde_json::json!({"file_path": format!("{home}/dev/p/file.rs")});
         let d = tool_detail("Edit", Some(&input)).unwrap();
         assert!(d.starts_with("~/"), "expected ~/ prefix, got {d}");
+    }
+
+    fn ask_question_line(id: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"2026-05-24T08:01:00Z","cwd":"/p","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"{id}","name":"AskUserQuestion","input":{{"questions":[{{"question":"Pick one?","header":"Choice","multiSelect":false,"options":[{{"label":"A","description":"first"}},{{"label":"B","description":"second"}}]}}]}}}}]}}}}"#
+        )
+    }
+
+    fn tool_result_line(id: &str) -> String {
+        format!(
+            r#"{{"type":"user","timestamp":"2026-05-24T08:03:00Z","cwd":"/p","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{id}","content":"A"}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn parses_ask_user_question_payload() {
+        let input = serde_json::json!({
+            "questions": [{
+                "question": "Pick one?",
+                "header": "Choice",
+                "multiSelect": true,
+                "options": [
+                    {"label": "A", "description": "first"},
+                    {"label": "B", "description": null}
+                ]
+            }]
+        });
+        let p = parse_ask_user_question(Some(&input)).unwrap();
+        let PendingInteraction::Question { questions } = p else {
+            panic!("expected Question");
+        };
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].question, "Pick one?");
+        assert_eq!(questions[0].header.as_deref(), Some("Choice"));
+        assert!(questions[0].multi_select);
+        assert_eq!(questions[0].options.len(), 2);
+        assert_eq!(questions[0].options[0].label, "A");
+        assert_eq!(
+            questions[0].options[0].description.as_deref(),
+            Some("first")
+        );
+        assert_eq!(questions[0].options[1].description, None);
+    }
+
+    #[test]
+    fn parses_exit_plan_mode_payload() {
+        let input = serde_json::json!({"plan": "# Do the thing\n- step"});
+        let p = parse_exit_plan_mode(Some(&input)).unwrap();
+        assert!(matches!(
+            p,
+            PendingInteraction::PlanApproval { plan } if plan.contains("Do the thing")
+        ));
+    }
+
+    #[test]
+    fn unanswered_question_is_pending() {
+        let lines = vec![user_text_line("hi"), ask_question_line("toolu_1")];
+        let got = parse_messages_from_lines(&lines, 10);
+        let q = got.last().unwrap();
+        assert_eq!(q.tool_uses.len(), 1);
+        assert_eq!(q.tool_uses[0].tool_use_id.as_deref(), Some("toolu_1"));
+        assert!(matches!(
+            q.tool_uses[0].pending,
+            Some(PendingInteraction::Question { .. })
+        ));
+    }
+
+    #[test]
+    fn answered_question_is_not_pending() {
+        let lines = vec![
+            user_text_line("hi"),
+            ask_question_line("toolu_1"),
+            tool_result_line("toolu_1"),
+        ];
+        let got = parse_messages_from_lines(&lines, 10);
+        // The question message still renders, but with no pending payload.
+        let q = got
+            .iter()
+            .find(|m| m.tool_uses.iter().any(|t| t.name == "AskUserQuestion"))
+            .unwrap();
+        assert!(q.tool_uses[0].pending.is_none());
     }
 }

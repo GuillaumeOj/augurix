@@ -77,10 +77,37 @@ export interface ProjectWithInstances {
 
 export type MessageRole = "user" | "assistant";
 
+export interface QuestionOption {
+  label: string;
+  description: string | null;
+}
+
+export interface PendingQuestion {
+  header: string | null;
+  question: string;
+  multi_select: boolean;
+  options: QuestionOption[];
+}
+
+/** An interactive prompt from Claude Code awaiting the user's answer. */
+export type PendingInteraction =
+  | { kind: "question"; questions: PendingQuestion[] }
+  | { kind: "plan-approval"; plan: string };
+
 export interface ToolUseEntry {
   name: string;
   detail: string | null;
+  /** Set only for interactive tools we may answer. */
+  tool_use_id?: string | null;
+  /** Present only while this tool_use is an unanswered interactive prompt. */
+  pending?: PendingInteraction | null;
 }
+
+/** What to send into a running Claude Code session. Mirrors the Rust enum. */
+export type SessionInput =
+  | { kind: "text"; text: string }
+  | { kind: "option"; indices: number[]; multi_select: boolean }
+  | { kind: "plan"; approve: boolean };
 
 export interface TranscriptMessage {
   /** `null` if the source entry had no timestamp; never fabricated. */
@@ -167,4 +194,10 @@ export const api = {
   setupKitty: () => invoke<KittySetupResult>("setup_kitty"),
   openTerminal: (pid: number | null, cwd: string, projectRoot: string | null) =>
     invoke<OpenTerminalOutcome>("open_terminal", { pid, cwd, projectRoot }),
+  sendSessionInput: (
+    pid: number | null,
+    cwd: string,
+    projectRoot: string | null,
+    input: SessionInput
+  ) => invoke<void>("send_session_input", { pid, cwd, projectRoot, input }),
 };
