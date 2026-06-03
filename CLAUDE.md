@@ -77,3 +77,17 @@ PRs are opened ready-for-review against `main`. Every PR:
 
 - is **assigned to the commit author** (`--assignee @me` — the author opening the PR);
 - has a **body following this fixed template**: `## Summary`, `## Highlights`, `## Test plan`.
+
+## 5. Dependencies — always pin exact versions
+
+Never use range specifiers (no `^`, no `~`). Every dependency and dev-dependency is pinned
+to an exact version.
+
+- **Frontend (`package.json`):** use bare exact versions, e.g. `"react": "19.1.0"` — not
+  `"^19.1.0"`. The repo's `.npmrc` sets `save-exact=true`, so `pnpm add <pkg>` pins
+  automatically. After any manual edit, run `pnpm install` to refresh `pnpm-lock.yaml`.
+
+- **Backend (`src-tauri/Cargo.toml`):** use the `=` operator for an exact version, e.g.
+  `serde = { version = "=1.0.219", features = ["derive"] }` and `anyhow = "=1.0.95"` — not
+  `"1"` or `"^1"` (Cargo treats a bare `"1"` as `^1`). Run `cargo update -p <crate> --precise`
+  / `cargo build` to refresh `Cargo.lock`.
