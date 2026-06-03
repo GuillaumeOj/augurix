@@ -133,6 +133,11 @@ struct TranscriptEntry {
     cwd: Option<String>,
     #[serde(default)]
     timestamp: Option<String>,
+    /// Set by Claude Code on synthetic, injected user entries (expanded skill
+    /// bodies, `<local-command-caveat>` blocks). These are not typed by the
+    /// user and must not be attributed to them.
+    #[serde(default, rename = "isMeta")]
+    is_meta: bool,
 }
 
 fn read_transcript_summary(path: &Path) -> Option<TranscriptSummary> {
@@ -157,6 +162,11 @@ fn read_transcript_summary(path: &Path) -> Option<TranscriptSummary> {
         };
         if let Some(c) = entry.cwd.as_ref() {
             last_cwd = Some(PathBuf::from(c));
+        }
+        // Injected scaffolding (skill bodies, caveats) isn't part of the
+        // conversation — don't let it skew last_role / preview.
+        if entry.is_meta {
+            continue;
         }
         let role = entry
             .role
@@ -436,6 +446,11 @@ pub fn parse_messages_from_lines(lines: &[String], limit: usize) -> Vec<Transcri
         let Ok(entry) = serde_json::from_str::<TranscriptEntry>(line) else {
             continue;
         };
+        // Drop synthetic injections (expanded skill bodies, command caveats).
+        // They carry role "user" but were never typed by the user.
+        if entry.is_meta {
+            continue;
+        }
         let role_raw = entry
             .role
             .clone()
@@ -641,6 +656,14 @@ fn extract_message_parts(
         }
     }
 
+    // Reduce a slash-command invocation envelope to a tidy "/commit" label
+    // instead of showing the raw <command-name>…</command-name> markup.
+    if let Some(t) = text.as_ref() {
+        if let Some(pretty) = prettify_command_invocation(t) {
+            text = Some(pretty);
+        }
+    }
+
     // Cap any accumulated text to avoid runaway payloads in the UI.
     if let Some(t) = text.as_mut() {
         if t.chars().count() > 1200 {
@@ -650,6 +673,32 @@ fn extract_message_parts(
 
     let _ = saw_any_part;
     (text, tools, only_tool_results)
+}
+
+/// Extract the inner text of the first `<tag>…</tag>` pair in `s`, if present.
+fn extract_tag(s: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = s.find(&open)? + open.len();
+    let end = s[start..].find(&close)? + start;
+    Some(s[start..end].to_string())
+}
+
+/// If `text` is a slash-command invocation envelope (`<command-name>/commit…`),
+/// reduce it to a tidy "/commit" (plus args, if any). Returns `None` otherwise.
+fn prettify_command_invocation(text: &str) -> Option<String> {
+    let name = extract_tag(text, "command-name")?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let args = extract_tag(text, "command-args").unwrap_or_default();
+    let args = args.trim();
+    if args.is_empty() {
+        Some(name.to_string())
+    } else {
+        Some(format!("{name} {args}"))
+    }
 }
 
 fn tool_detail(name: &str, input: Option<&serde_json::Value>) -> Option<String> {
@@ -808,6 +857,20 @@ mod tests {
         r#"{"type":"user","timestamp":"2026-05-24T08:03:00Z","cwd":"/p","message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]}}"#.to_string()
     }
 
+    fn meta_user_line(text: &str) -> String {
+        format!(
+            r#"{{"type":"user","timestamp":"2026-05-24T08:02:30Z","cwd":"/p","isMeta":true,"message":{{"role":"user","content":[{{"type":"text","text":"{}"}}]}}}}"#,
+            text
+        )
+    }
+
+    fn command_invocation_line(inner: &str) -> String {
+        format!(
+            r#"{{"type":"user","timestamp":"2026-05-24T08:02:00Z","cwd":"/p","message":{{"role":"user","content":[{{"type":"text","text":"{}"}}]}}}}"#,
+            inner
+        )
+    }
+
     #[test]
     fn parses_mixed_messages() {
         let lines = vec![
@@ -827,6 +890,35 @@ mod tests {
         assert_eq!(got[2].tool_uses.len(), 1);
         assert_eq!(got[2].tool_uses[0].name, "Read");
         assert_eq!(got[3].text.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn skips_injected_meta_entries() {
+        let lines = vec![
+            command_invocation_line(
+                "<command-message>commit</command-message> <command-name>/commit</command-name> <command-args></command-args>",
+            ),
+            meta_user_line("Base directory for this skill: /x/.claude/skills/commit  Steps: ..."),
+            meta_user_line("<local-command-caveat>Caveat: The messages below ...</local-command-caveat>"),
+            assistant_text_line("on it"),
+        ];
+        let got = parse_messages_from_lines(&lines, 10);
+        // The two isMeta injections are gone; only the real invocation + reply remain.
+        assert_eq!(got.len(), 2, "isMeta scaffolding must be dropped");
+        assert_eq!(got[0].role, MessageRole::User);
+        assert_eq!(got[0].text.as_deref(), Some("/commit"));
+        assert_eq!(got[1].role, MessageRole::Assistant);
+        assert_eq!(got[1].text.as_deref(), Some("on it"));
+    }
+
+    #[test]
+    fn prettifies_command_invocation_with_args() {
+        let lines = vec![command_invocation_line(
+            "<command-message>ticket</command-message> <command-name>/ticket</command-name> <command-args>FUS-1249</command-args>",
+        )];
+        let got = parse_messages_from_lines(&lines, 10);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text.as_deref(), Some("/ticket FUS-1249"));
     }
 
     #[test]
