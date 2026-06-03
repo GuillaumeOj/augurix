@@ -13,6 +13,8 @@ export const qk = {
     ["status", "instance", projectId, instanceId] as const,
   messages: (projectId: UUID, instanceId: UUID) =>
     ["status", "messages", projectId, instanceId] as const,
+  prompt: (projectId: UUID, instanceId: UUID) =>
+    ["status", "prompt", projectId, instanceId] as const,
   diff: (path: string, scope: string) => ["diff", path, scope] as const,
   baseDiff: (path: string, base: string, includeWorkingTree: boolean) =>
     ["diff", "base", path, base, includeWorkingTree] as const,
@@ -60,6 +62,26 @@ export function useInstanceMessages(
     queryFn: () => api.instanceMessages(projectId!, instanceId!, limit),
     enabled: !!projectId && !!instanceId,
     refetchInterval: 5_000,
+  });
+}
+
+/** Poll the session's live terminal screen for a TUI selection prompt
+ * (permission request / plan approval). Faster cadence than the transcript
+ * since it's interactive; only runs while there's a session to read. */
+export function useSessionPrompt(
+  projectId: UUID | undefined,
+  instanceId: UUID | undefined,
+  pid: number | null,
+  cwd: string,
+  projectRoot: string | null,
+  enabled: boolean
+) {
+  return useQuery({
+    queryKey:
+      projectId && instanceId ? qk.prompt(projectId, instanceId) : ["status", "prompt", "noop"],
+    queryFn: () => api.readSessionPrompt(pid, cwd, projectRoot),
+    enabled: !!projectId && !!instanceId && enabled,
+    refetchInterval: 2_000,
   });
 }
 
